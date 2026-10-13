@@ -3,18 +3,20 @@
 """
 SUPER PYTHON BROS ONLINE - SERVIDOR DEDICADO GLOBAL
 Maneja salas de juego, sincro de físicas a 60Hz y matchmaking.
-Requisitos: Python 3.8+ (Sin librerías externas)
+Requisitos: pip install websockets
 Ejecutar: python server.py
 """
 import asyncio
 import json
 import logging
+import os
 import random
+import websockets
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-PORT = 80
-HOST = '0.0.0.0'
+# Render asigna dinámicamente el puerto en la variable PORT
+PORT = int(os.environ.get("PORT", 10000))
 
 rooms = {}
 
@@ -22,18 +24,18 @@ class GameRoom:
     def __init__(self, room_id):
         self.room_id = room_id
         self.seed = random.randint(10000, 999999)
-        self.clients = {}  # writer -> player_id
+        self.clients = {}  # ws -> player_id
         self.players_state = {}
 
-    def add_player(self, writer, p_id, name):
-        self.clients[writer] = p_id
+    def add_player(self, ws, p_id, name):
+        self.clients[ws] = p_id
         colors = [(40, 120, 230), (230, 70, 160), (40, 200, 100), (240, 180, 40)]
         color = colors[p_id % len(colors)]
         
         self.players_state[p_id] = {
             'id': p_id,
             'name': name,
-            'x': 70 + (p_id * 40),
+            'x': 80 + (p_id * 60),
             'y': 400,
             'vx': 0.0,
             'vy': 0.0,
@@ -46,39 +48,33 @@ class GameRoom:
             'anim': 0.0
         }
 
-    def remove_player(self, writer):
-        if writer in self.clients:
-            p_id = self.clients[writer]
-            del self.clients[writer]
+    def remove_player(self, ws):
+        if ws in self.clients:
+            p_id = self.clients[ws]
+            del self.clients[ws]
             if p_id in self.players_state:
                 del self.players_state[p_id]
             return p_id
         return None
 
     async def broadcast(self, message, exclude=None):
-        data = (json.dumps(message) + "\n").encode('utf-8')
-        for writer in list(self.clients.keys()):
-            if writer != exclude:
+        data = json.dumps(message)
+        for ws in list(self.clients.keys()):
+            if ws != exclude:
                 try:
-                    writer.write(data)
-                    await writer.drain()
+                    await ws.send(data)
                 except Exception:
-                    self.remove_player(writer)
+                    self.remove_player(ws)
 
-async def handle_client(reader, writer):
-    addr = writer.get_extra_info('peername')
-    logging.info(f"Nueva conexión desde {addr}")
+async def handle_client(websocket):
+    logging.info(f"Nueva conexión WebSocket recibida")
     current_room = None
     player_id = None
 
     try:
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
-            
+        async for message in websocket:
             try:
-                msg = json.loads(line.decode('utf-8').strip())
+                msg = json.loads(message)
             except Exception:
                 continue
 
@@ -93,7 +89,7 @@ async def handle_client(reader, writer):
                 
                 current_room = rooms[room_id]
                 player_id = len(current_room.clients)
-                current_room.add_player(writer, player_id, name)
+                current_room.add_player(websocket, player_id, name)
 
                 init_msg = {
                     'type': 'init',
@@ -101,13 +97,12 @@ async def handle_client(reader, writer):
                     'seed': current_room.seed,
                     'players': current_room.players_state
                 }
-                writer.write((json.dumps(init_msg) + "\n").encode('utf-8'))
-                await writer.drain()
+                await websocket.send(json.dumps(init_msg))
 
                 await current_room.broadcast({
                     'type': 'player_joined',
                     'player': current_room.players_state[player_id]
-                }, exclude=writer)
+                }, exclude=websocket)
 
             elif mtype == 'update' and current_room and player_id is not None:
                 p_data = msg.get('state', {})
@@ -117,30 +112,26 @@ async def handle_client(reader, writer):
                 await current_room.broadcast({
                     'type': 'world_state',
                     'players': current_room.players_state
-                }, exclude=writer)
+                }, exclude=websocket)
 
             elif mtype == 'ping':
-                writer.write((json.dumps({'type': 'pong', 't': msg.get('t', 0)}) + "\n").encode('utf-8'))
-                await writer.drain()
+                await websocket.send(json.dumps({'type': 'pong', 't': msg.get('t', 0)}))
 
     except Exception as e:
-        logging.error(f"Error con cliente {addr}: {e}")
+        logging.error(f"Error con cliente: {e}")
     finally:
         if current_room:
-            pid = current_room.remove_player(writer)
+            pid = current_room.remove_player(websocket)
             if pid is not None:
                 await current_room.broadcast({'type': 'player_left', 'id': pid})
-                logging.info(f"Jugador {pid} desconectado de sala {current_room.room_id}")
+                logging.info(f"Jugador {pid} desconectado")
             if not current_room.clients:
                 del rooms[current_room.room_id]
-        writer.close()
-        await writer.wait_closed()
 
 async def main():
-    server = await asyncio.start_server(handle_client, HOST, PORT)
-    logging.info(f"Servidor Online Global activo en el puerto {PORT}...")
-    async with server:
-        await server.serve_forever()
+    async with websockets.serve(handle_client, "0.0.0.0", PORT):
+        logging.info(f"Servidor WebSocket iniciado en el puerto {PORT}...")
+        await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
