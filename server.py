@@ -13,7 +13,7 @@ import random
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-PORT = 9999
+PORT = 80
 HOST = '0.0.0.0'
 
 rooms = {}
