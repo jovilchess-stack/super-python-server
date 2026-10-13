@@ -1,308 +1,146 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SUPER PYTHON BROS - EDICIÓN ONLINE GLOBAL 100x MEJORADA
-Requisitos: pip install pygame
-Ejecutar: python client.py
+SUPER PYTHON BROS ONLINE - SERVIDOR DEDICADO GLOBAL
+Maneja salas de juego, sincro de físicas a 60Hz y matchmaking.
+Requisitos: Python 3.8+ (Sin librerías externas)
+Ejecutar: python server.py
 """
-import array
+import asyncio
 import json
-import math
-import os
+import logging
 import random
-import socket
-import sys
-import threading
-import time
-import pygame
 
-# ----------------------------------------------------------------- Red Online
-class NetworkClient:
-    def __init__(self, host, port):
-        self.host = host
-        self.port = port
-        self.sock = None
-        self.connected = False
-        self.player_id = None
-        self.seed = 12345
-        self.remote_players = {}
-        self.ping = 0
-        self.room_id = "global_1"
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-    def connect(self, name="Jugador", room="global_1"):
-        self.room_id = room
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(5.0)
-            self.sock.connect((self.host, self.port))
-            self.sock.settimeout(None)
-            self.connected = True
-            
-            join_msg = json.dumps({'type': 'join', 'name': name, 'room': room}) + "\n"
-            self.sock.sendall(join_msg.encode('utf-8'))
+PORT = 9999
+HOST = '0.0.0.0'
 
-            threading.Thread(target=self._listen, daemon=True).start()
-            threading.Thread(target=self._ping_loop, daemon=True).start()
-            return True
-        except Exception as e:
-            print(f"Error de conexión online: {e}")
-            self.connected = False
-            return False
+rooms = {}
 
-    def _listen(self):
-        buffer = ""
-        while self.connected:
-            try:
-                data = self.sock.recv(4096).decode('utf-8')
-                if not data:
-                    break
-                buffer += data
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    if line.strip():
-                        self._handle_message(json.loads(line.strip()))
-            except Exception:
+class GameRoom:
+    def __init__(self, room_id):
+        self.room_id = room_id
+        self.seed = random.randint(10000, 999999)
+        self.clients = {}  # writer -> player_id
+        self.players_state = {}
+
+    def add_player(self, writer, p_id, name):
+        self.clients[writer] = p_id
+        colors = [(40, 120, 230), (230, 70, 160), (40, 200, 100), (240, 180, 40)]
+        color = colors[p_id % len(colors)]
+        
+        self.players_state[p_id] = {
+            'id': p_id,
+            'name': name,
+            'x': 70 + (p_id * 40),
+            'y': 400,
+            'vx': 0.0,
+            'vy': 0.0,
+            'power': 0,
+            'facing': 1,
+            'state': 'play',
+            'score': 0,
+            'lives': 3,
+            'color': color,
+            'anim': 0.0
+        }
+
+    def remove_player(self, writer):
+        if writer in self.clients:
+            p_id = self.clients[writer]
+            del self.clients[writer]
+            if p_id in self.players_state:
+                del self.players_state[p_id]
+            return p_id
+        return None
+
+    async def broadcast(self, message, exclude=None):
+        data = (json.dumps(message) + "\n").encode('utf-8')
+        for writer in list(self.clients.keys()):
+            if writer != exclude:
+                try:
+                    writer.write(data)
+                    await writer.drain()
+                except Exception:
+                    self.remove_player(writer)
+
+async def handle_client(reader, writer):
+    addr = writer.get_extra_info('peername')
+    logging.info(f"Nueva conexión desde {addr}")
+    current_room = None
+    player_id = None
+
+    try:
+        while True:
+            line = await reader.readline()
+            if not line:
                 break
-        self.connected = False
-
-    def _handle_message(self, msg):
-        mtype = msg.get('type')
-        if mtype == 'init':
-            self.player_id = msg['id']
-            self.seed = msg['seed']
-            self.remote_players = msg['players']
-        elif mtype == 'world_state':
-            self.remote_players = msg['players']
-        elif mtype == 'player_joined':
-            p = msg['player']
-            self.remote_players[p['id']] = p
-        elif mtype == 'player_left':
-            pid = msg['id']
-            if pid in self.remote_players:
-                del self.remote_players[pid]
-        elif mtype == 'pong':
-            self.ping = int((time.time() - msg['t']) * 1000)
-
-    def _ping_loop(self):
-        while self.connected:
-            try:
-                ping_msg = json.dumps({'type': 'ping', 't': time.time()}) + "\n"
-                self.sock.sendall(ping_msg.encode('utf-8'))
-                time.sleep(2.0)
-            except Exception:
-                break
-
-    def send_state(self, state):
-        if not self.connected:
-            return
-        try:
-            msg = json.dumps({'type': 'update', 'state': state}) + "\n"
-            self.sock.sendall(msg.encode('utf-8'))
-        except Exception:
-            self.connected = False
-
-# ----------------------------------------------------------------- Motor del Juego
-T = 40
-ROWS = 14
-W, H = 960, ROWS * T
-FPS = 60
-GROUND = 12
-SOLID = set("GBQUSpqab")
-
-THEMES = {
-    'overworld': dict(bg=(92, 148, 252), brick=((200, 76, 12), (96, 28, 0)), ground=((200, 76, 12), (96, 28, 0)),
-                      stair=(196, 110, 44), pipe=(0, 168, 0), deco=True, stars=False, lava=False),
-}
-
-class Player:
-    def __init__(self, idx, name):
-        self.idx = idx
-        self.name = name
-        self.x, self.y = 100, 400
-        self.w, self.h = 30, 38
-        self.vx, self.vy = 0, 0
-        self.on_ground = False
-        self.facing = 1
-        self.power = 0
-        self.score = 0
-        self.lives = 3
-        self.state = 'play'
-        self.anim = 0.0
-
-    def rect(self):
-        return pygame.Rect(int(self.x), int(self.y), self.w, self.h)
-
-    def update(self, keys, level):
-        left = keys[pygame.K_a] or keys[pygame.K_LEFT]
-        right = keys[pygame.K_d] or keys[pygame.K_RIGHT]
-        jump = keys[pygame.K_SPACE] or keys[pygame.K_w] or keys[pygame.K_UP]
-
-        if left:
-            self.vx = -4.5
-            self.facing = -1
-        elif right:
-            self.vx = 4.5
-            self.facing = 1
-        else:
-            self.vx *= 0.8
-
-        if jump and self.on_ground:
-            self.vy = -12.5
-            self.on_ground = False
-
-        self.vy = min(self.vy + 0.6, 12)
-        
-        # Movimiento X
-        self.x += self.vx
-        for c, r, tr in level.tiles_in(self.rect()):
-            if self.vx > 0: self.x = tr.left - self.w
-            elif self.vx < 0: self.x = tr.right
-
-        # Movimiento Y
-        self.y += self.vy
-        self.on_ground = False
-        for c, r, tr in level.tiles_in(self.rect()):
-            if self.vy > 0:
-                self.y = tr.top - self.h
-                self.vy = 0
-                self.on_ground = True
-            elif self.vy < 0:
-                self.y = tr.bottom
-                self.vy = 0
-
-        self.anim += abs(self.vx) * 0.1
-
-    def draw(self, scr, cam_x, color=None):
-        c = color or ((40, 120, 230) if self.idx == 0 else (230, 70, 160))
-        r = pygame.Rect(int(self.x) - cam_x, int(self.y), self.w, self.h)
-        pygame.draw.rect(scr, c, r, border_radius=6)
-        pygame.draw.rect(scr, (255, 255, 255), r, 2, border_radius=6)
-        
-        # Ojos indicando dirección
-        eye_x = r.right - 8 if self.facing > 0 else r.left + 4
-        pygame.draw.rect(scr, (255, 255, 255), (eye_x, r.top + 8, 4, 8))
-
-class Level:
-    def __init__(self, seed):
-        rng = random.Random(seed)
-        self.cols = 200
-        self.grid = [[' '] * self.cols for _ in range(ROWS)]
-        
-        # Generación de suelo
-        for c in range(self.cols):
-            if c not in (30, 31, 75, 76, 120, 121):  # Huecos
-                self.grid[12][c] = self.grid[13][c] = 'G'
-            if rng.random() < 0.2 and c > 10:
-                self.grid[8][c] = 'Q'
-            elif rng.random() < 0.15 and c > 10:
-                self.grid[8][c] = 'B'
-
-    def is_solid(self, c, r):
-        if c < 0 or c >= self.cols: return True
-        if r < 0 or r >= ROWS: return False
-        return self.grid[r][c] in SOLID
-
-    def tiles_in(self, rect):
-        out = []
-        c0, c1 = rect.left // T, (rect.right - 1) // T
-        r0, r1 = max(rect.top // T, 0), min((rect.bottom - 1) // T, ROWS - 1)
-        for c in range(c0, c1 + 1):
-            for r in range(r0, r1 + 1):
-                if self.is_solid(c, r):
-                    out.append((c, r, pygame.Rect(c * T, r * T, T, T)))
-        return out
-
-class Game:
-    def __init__(self):
-        pygame.init()
-        self.screen = pygame.display.set_mode((W, H))
-        pygame.display.set_caption("SUPER PYTHON BROS - MULTIJUGADOR ONLINE GLOBAL")
-        self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("arial", 20, bold=True)
-        self.big_font = pygame.font.SysFont("arial", 40, bold=True)
-        
-        self.net = NetworkClient("127.0.0.1", 9999) # IP Servidor Global
-        self.online_mode = False
-        self.local_player = Player(0, "ALEX")
-        self.level = Level(12345)
-        self.cam_x = 0
-
-    def start_online(self):
-        name = f"Heroe_{random.randint(100, 999)}"
-        if self.net.connect(name=name, room="global_1"):
-            self.online_mode = True
-            self.level = Level(self.net.seed)
-            print("Conectado con éxito al Servidor Global!")
-
-    def run(self):
-        running = True
-        while running:
-            for e in pygame.event.get():
-                if e.type == pygame.QUIT:
-                    running = False
-                elif e.type == pygame.KEYDOWN and e.key == pygame.K_o:
-                    self.start_online()
-
-            keys = pygame.key.get_pressed()
-            self.local_player.update(keys, self.level)
-
-            # Sincronización Online
-            if self.online_mode and self.net.connected:
-                self.net.send_state({
-                    'x': self.local_player.x,
-                    'y': self.local_player.y,
-                    'vx': self.local_player.vx,
-                    'vy': self.local_player.vy,
-                    'facing': self.local_player.facing,
-                    'anim': self.local_player.anim
-                })
-
-            # Cámara suave
-            self.cam_x = max(0, int(self.local_player.x - W // 3))
-
-            # Dibujado
-            self.screen.fill((92, 148, 252))
-
-            # Dibujar Nivel
-            for c in range(self.cam_x // T, (self.cam_x + W) // T + 2):
-                for r in range(ROWS):
-                    if c < self.level.cols and self.level.grid[r][c] != ' ':
-                        ch = self.level.grid[r][c]
-                        color = (200, 76, 12) if ch == 'G' or ch == 'B' else (255, 188, 0)
-                        pygame.draw.rect(self.screen, color, (c * T - self.cam_x, r * T, T, T))
-                        pygame.draw.rect(self.screen, (0, 0, 0), (c * T - self.cam_x, r * T, T, T), 1)
-
-            # Dibujar Jugador Local
-            self.local_player.draw(self.screen, self.cam_x)
-
-            # Dibujar Jugadores Remotos Online
-            if self.online_mode and self.net.connected:
-                for pid, pdata in list(self.net.remote_players.items()):
-                    if pid != self.net.player_id:
-                        rx, ry = pdata.get('x', 0) - self.cam_x, pdata.get('y', 0)
-                        col = pdata.get('color', (230, 70, 160))
-                        r = pygame.Rect(int(rx), int(ry), 30, 38)
-                        pygame.draw.rect(self.screen, col, r, border_radius=6)
-                        pygame.draw.rect(self.screen, (255, 255, 255), r, 2, border_radius=6)
-                        
-                        # Nombre sobre el jugador
-                        lbl = self.font.render(pdata.get('name', 'Player'), True, (255, 255, 255))
-                        self.screen.blit(lbl, (rx - 10, ry - 22))
-
-            # HUD y Estado Online
-            if self.online_mode and self.net.connected:
-                hud_txt = f"ONLINE GLOBAL | Sala: {self.net.room_id} | Ping: {self.net.ping}ms"
-                hud = self.font.render(hud_txt, True, (100, 255, 100))
-            else:
-                hud = self.font.render("MODO LOCAL - Presiona 'O' para conectar Online Global", True, (255, 255, 255))
             
-            self.screen.blit(hud, (15, 15))
+            try:
+                msg = json.loads(line.decode('utf-8').strip())
+            except Exception:
+                continue
 
-            pygame.display.flip()
-            self.clock.tick(FPS)
+            mtype = msg.get('type')
 
-        pygame.quit()
+            if mtype == 'join':
+                room_id = msg.get('room', 'global_1')
+                name = msg.get('name', 'Jugador')
+                
+                if room_id not in rooms:
+                    rooms[room_id] = GameRoom(room_id)
+                
+                current_room = rooms[room_id]
+                player_id = len(current_room.clients)
+                current_room.add_player(writer, player_id, name)
+
+                init_msg = {
+                    'type': 'init',
+                    'id': player_id,
+                    'seed': current_room.seed,
+                    'players': current_room.players_state
+                }
+                writer.write((json.dumps(init_msg) + "\n").encode('utf-8'))
+                await writer.drain()
+
+                await current_room.broadcast({
+                    'type': 'player_joined',
+                    'player': current_room.players_state[player_id]
+                }, exclude=writer)
+
+            elif mtype == 'update' and current_room and player_id is not None:
+                p_data = msg.get('state', {})
+                if player_id in current_room.players_state:
+                    current_room.players_state[player_id].update(p_data)
+                
+                await current_room.broadcast({
+                    'type': 'world_state',
+                    'players': current_room.players_state
+                }, exclude=writer)
+
+            elif mtype == 'ping':
+                writer.write((json.dumps({'type': 'pong', 't': msg.get('t', 0)}) + "\n").encode('utf-8'))
+                await writer.drain()
+
+    except Exception as e:
+        logging.error(f"Error con cliente {addr}: {e}")
+    finally:
+        if current_room:
+            pid = current_room.remove_player(writer)
+            if pid is not None:
+                await current_room.broadcast({'type': 'player_left', 'id': pid})
+                logging.info(f"Jugador {pid} desconectado de sala {current_room.room_id}")
+            if not current_room.clients:
+                del rooms[current_room.room_id]
+        writer.close()
+        await writer.wait_closed()
+
+async def main():
+    server = await asyncio.start_server(handle_client, HOST, PORT)
+    logging.info(f"Servidor Online Global activo en el puerto {PORT}...")
+    async with server:
+        await server.serve_forever()
 
 if __name__ == "__main__":
-    game = Game()
-    game.run()
+    asyncio.run(main())
